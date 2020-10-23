@@ -18,16 +18,14 @@ load("@build_bazel_rules_nodejs//:providers.bzl", "LinkablePackageInfo", "NpmPac
 
 # pylint: disable=unused-argument
 # pylint: disable=missing-docstring
-load("@build_bazel_rules_typescript//internal:common/compilation.bzl", "COMMON_ATTRIBUTES", "DEPS_ASPECTS", "compile_ts", "ts_providers_dict_to_struct")
-load("@build_bazel_rules_typescript//internal:common/tsconfig.bzl", "create_tsconfig")
-load("//packages/typescript/internal:ts_config.bzl", "TsConfigInfo")
+load("//@bazel/typescript/internal:common/compilation.bzl", "COMMON_ATTRIBUTES", "DEPS_ASPECTS", "compile_ts", "ts_providers_dict_to_struct")
+load("//@bazel/typescript/internal:common/tsconfig.bzl", "create_tsconfig")
+load("//@bazel/typescript/internal:ts_config.bzl", "TsConfigInfo")
 
 # NB: substituted with "//@bazel/typescript/bin:tsc_wrapped" in the pkg_npm rule
-_DEFAULT_COMPILER = "@build_bazel_rules_typescript//internal:tsc_wrapped_bin"
+_DEFAULT_COMPILER = "//@bazel/typescript/bin:tsc_wrapped"
 _DEFAULT_NODE_MODULES = Label(
-    # BEGIN-INTERNAL
-    "@npm" +
-    # END-INTERNAL
+    
     "//typescript:typescript__typings",
 )
 
@@ -213,6 +211,64 @@ def _devmode_compile_action(ctx, inputs, outputs, tsconfig_file, node_opts):
         description = "devmode",
     )
 
+def _outputs(ctx, label, srcs_files = []):
+    """Returns closure js, devmode js, and .d.ts output files.
+    Args:
+      ctx: ctx.
+      label: Label. package label.
+      srcs_files: File list. sources files list.
+    Returns:
+      A struct of file lists for different output types and their relationship to each other.
+    """
+    workspace_segments = label.workspace_root.split("/") if label.workspace_root else []
+    package_segments = label.package.split("/") if label.package else []
+    trim = len(workspace_segments) + len(package_segments)
+    create_shim_files = False
+
+    closure_js_files = []
+    devmode_js_files = []
+    declaration_files = []
+    transpilation_infos = []
+    for input_file in srcs_files:
+        is_dts = input_file.short_path.endswith(".d.ts")
+        if is_dts and not create_shim_files:
+            continue
+        if input_file.basename.endswith(".json"):
+            continue
+        basename = "/".join(input_file.short_path.split("/")[trim:])
+        for ext in [".d.ts", ".tsx", ".ts"]:
+            if basename.endswith(ext):
+                basename = basename[:-len(ext)]
+                break
+        closure_js_file = ctx.actions.declare_file(basename + ".mjs")
+        closure_js_files.append(closure_js_file)
+
+        # Temporary until all imports of ngfactory/ngsummary files are removed
+        # TODO(alexeagle): clean up after Ivy launch
+        if getattr(ctx.attr, "use_angular_plugin", False):
+            closure_js_files += [ctx.actions.declare_file(basename + ".ngfactory.mjs")]
+            closure_js_files += [ctx.actions.declare_file(basename + ".ngsummary.mjs")]
+
+        if not is_dts:
+            devmode_js_file = ctx.actions.declare_file(basename + ".js")
+            devmode_js_files.append(devmode_js_file)
+            transpilation_infos.append(struct(closure = closure_js_file, devmode = devmode_js_file))
+            declaration_files += [ctx.actions.declare_file(basename + ".d.ts")]
+
+            # Temporary until all imports of ngfactory/ngsummary files are removed
+            # TODO(alexeagle): clean up after Ivy launch
+            if getattr(ctx.attr, "use_angular_plugin", False):
+                devmode_js_files += [ctx.actions.declare_file(basename + ".ngfactory.js")]
+                devmode_js_files += [ctx.actions.declare_file(basename + ".ngsummary.js")]
+                declaration_files += [ctx.actions.declare_file(basename + ".ngfactory.d.ts")]
+                declaration_files += [ctx.actions.declare_file(basename + ".ngsummary.d.ts")]
+    return struct(
+        closure_js = closure_js_files,
+        devmode_js = devmode_js_files,
+        declarations = declaration_files,
+        transpilation_infos = transpilation_infos,
+    )
+
 def tsc_wrapped_tsconfig(
         ctx,
         files,
@@ -246,8 +302,8 @@ def tsc_wrapped_tsconfig(
     config = create_tsconfig(
         ctx,
         # Filter out package.json files that are included in DeclarationInfo
-        # tsconfig files=[] property should only be .ts/.d.ts
-        [f for f in files if f.path.endswith(".ts") or f.path.endswith(".tsx")],
+        # tsconfig files=[] property should only be .ts/.d.ts/.json
+        [f for f in files if f.path.endswith(".ts") or f.path.endswith(".tsx") or (f.path.endswith(".json") and not f.path.endswith("package.json"))],
         srcs,
         devmode_manifest = devmode_manifest,
         node_modules_root = node_modules_root,
@@ -311,6 +367,7 @@ def _ts_library_impl(ctx):
         compile_action = _compile_action,
         devmode_compile_action = _devmode_compile_action,
         tsc_wrapped_tsconfig = tsc_wrapped_tsconfig,
+        outputs = _outputs,
     )
 
     # Add in shared JS providers.
@@ -467,7 +524,7 @@ This value will override the `target` option in the user supplied tsconfig.""",
         ),
         "srcs": attr.label_list(
             doc = "The TypeScript source files to compile.",
-            allow_files = [".ts", ".tsx"],
+            allow_files = [".ts", ".tsx", ".json"],
             mandatory = True,
         ),
         "supports_workers": attr.bool(
